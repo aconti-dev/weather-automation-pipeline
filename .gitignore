@@ -1,0 +1,25 @@
+# Env
+.env
+*.env
+
+# Virtual environment
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Output generated files
+outputs/
+*.pdf
+*.png
+*.jpg
+
+# OS
+Thumbs.db
+.DS_Store
