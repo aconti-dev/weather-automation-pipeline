@@ -1,15 +1,14 @@
-# 🌧 Weather Automation Pipeline  
-Python | Async API Integration | PDF Generation | HTML Automation
+# 🌧 Weather Automation Pipeline (Python + API + PDF + HTML)
 
-Pipeline automatizzata per raccolta dati meteorologici tramite Weather.com / Wunderground (PWS API) con generazione automatica di:
+Pipeline automatizzata per la raccolta di dati meteo da Weather.com / Wunderground (PWS API), con:
 
 - Backup JSON giornaliero
-- Storico mensile aggregato
-- Report PDF dinamici per singola stazione
+- Storico mensile per stazione
+- Report PDF dinamici (tabella + grafico + soglie colore)
 - Pagine HTML regionali responsive (mobile-first)
 - Automazione asincrona con asyncio + aiohttp
 
-Progetto dimostrativo di automazione data-driven e workflow scalabile.
+Progetto sviluppato come esempio reale di automazione data-driven e workflow scalabile.
 
 ---
 
@@ -17,81 +16,84 @@ Progetto dimostrativo di automazione data-driven e workflow scalabile.
 
 - Integrazione API REST (Weather.com PWS)
 - Fetch asincrono con asyncio
-- Controllo concorrenza tramite Semaphore
 - Validazione dati e gestione anomalie
-- Persistenza JSON strutturata
-- Generazione PDF dinamici con ReportLab (grafici + soglie colore)
-- Generazione HTML responsive con ricerca dinamica
-- Struttura GitHub-friendly (no chiavi hardcoded, no percorsi server)
+- Persistenza JSON strutturata (giornaliero + mensile)
+- Generazione PDF dinamici con ReportLab
+- Generazione HTML responsive con ricerca live
+- Struttura repository GitHub-ready (no chiavi hardcoded)
 
 ---
 
-## 📦 Struttura del progetto
+## 🧱 Struttura del progetto
 
-project-root/
-│
-├── weather_pipeline.py
-├── stations_by_region.sample.json
-├── .env.example
-├── .gitignore
-└── README.md
-
-Output generato automaticamente nella cartella:
-
-outputs/
+weather-automation-pipeline/
+├─ src/
+│  └─ weather_pipeline.py
+├─ stations_by_region.sample.json
+├─ .env.example
+├─ .gitignore
+└─ README.md
 
 ---
 
-## ⚙️ Installazione
+## ✅ Requisiti
 
-1. Clona il repository:
+- Python 3.10+
+- API Key Weather.com / Wunderground PWS
+- Connessione internet
 
-git clone https://github.com/tuo-username/weather-automation-pipeline.git  
-cd weather-automation-pipeline  
+---
 
-2. Crea ambiente virtuale:
+## ⚙️ Setup (Windows)
+
+Apri PowerShell nella cartella del progetto.
+
+### 1️⃣ Crea ambiente virtuale
 
 python -m venv .venv  
+.\.venv\Scripts\Activate.ps1
 
-Attivazione:
+Se PowerShell blocca l’attivazione:
 
-Windows:
-.venv\Scripts\activate  
-
-Mac / Linux:
-source .venv/bin/activate  
-
-3. Installa dipendenze:
-
-pip install aiohttp reportlab  
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 
 ---
 
-## 🔐 Configurazione API
+### 2️⃣ Installa dipendenze
 
-Copia `.env.example` in `.env` e inserisci la tua chiave:
-
-WU_API_KEY=LA_TUA_API_KEY  
-
-Oppure imposta variabile ambiente manualmente.
+pip install aiohttp reportlab python-dotenv
 
 ---
 
-## 🗂 Configurazione stazioni
+## 🔐 Configurazione
 
-Copia:
+### 1️⃣ Crea il file .env
 
-stations_by_region.sample.json  
+Copia `.env.example` e rinominalo in `.env`.
 
-Rinominalo in:
+Inserisci la tua chiave:
 
-stations_by_region.json  
+WU_API_KEY=INCOLLA_LA_TUA_API_KEY
 
-Struttura richiesta:
+Il file `.env` non viene caricato su GitHub.
+
+---
+
+### 2️⃣ Configura le stazioni
+
+Duplica `stations_by_region.sample.json` e rinominalo in:
+
+stations_by_region.json
+
+Formato esempio:
 
 {
-  "NomeRegione": {
-    "STATION_ID": "Nome Città"
+  "Lombardia": {
+    "ISTATIONID1": "Como",
+    "ISTATIONID2": "Milano"
+  },
+  "Veneto": {
+    "ISTATIONID3": "Verona"
   }
 }
 
@@ -99,36 +101,49 @@ Struttura richiesta:
 
 ## ▶️ Esecuzione
 
-python weather_pipeline.py
-
-I file generati verranno creati automaticamente in:
-
-outputs/
+python .\src\weather_pipeline.py
 
 ---
 
-## 🧠 Architettura tecnica
+## 📦 Output generato
 
-- Async I/O per gestione concorrente di molte stazioni
-- Persistenza incrementale giornaliera e mensile
-- Generazione PDF dinamici con grafico integrato
-- Generazione HTML server-side responsive
+- JSON giornalieri (backup)
+- Storico mensile per stazione
+- PDF dinamici per stazione
+- HTML regionali responsive
+
+---
+
+## 🔒 Sicurezza
+
+- Nessuna API key hardcoded
 - Configurazione tramite variabili ambiente
-- Separazione completa tra codice e configurazione
+- File sensibili ignorati via .gitignore
 
 ---
 
-## 📌 Note
+## 📈 Possibili miglioramenti futuri
 
-- Nessuna API key è presente nel codice
-- Nessun percorso server hardcoded
-- Dataset completo non incluso nel repository (versione demo fornita)
-- Struttura compatibile con deploy su WordPress o static hosting
+- requirements.txt ufficiale
+- Logging strutturato
+- Dockerizzazione
+- Task Scheduler / cron automation
+- Test automatici
+
+---
+
+## 📄 Licenza
+
+MIT (consigliata se vuoi renderlo riutilizzabile)
 
 ---
 
 ## 👨‍💻 Autore
 
 Alfonso Conti  
-Digital Automation & Data Workflow  
-Python | API Integration | AI Automation
+Digital Automation & Data Workflow Engineer  
+
+Python | API Integration | Data Pipelines | AI Automation  
+
+📍 Como, Italy  
+🔗 LinkedIn: https://www.linkedin.com/in/alfonso-conti-8580603b2/
