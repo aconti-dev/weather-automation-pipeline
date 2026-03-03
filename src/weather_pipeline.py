@@ -1,33 +1,33 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Weather Underground / Weather.com PWS (API) -> daily JSON + monthly history JSON + per-city PDF + per-region HTML.
 
-✅ Repo/GitHub friendly:
+GitHub-friendly:
 - NO hardcoded API keys
-- NO hardcoded server paths (/home/customer/...)
-- NO hardcoded domain
-- Output in ./outputs/ by default
-- Public links in HTML are configurable via env
-
-Requisiti:
-- Python 3.11+
-- aiohttp
-- reportlab
+- NO hardcoded server paths
+- Output in ./outputs (configurable via OUTPUT_BASE_DIR)
+- Public links in HTML configurable via PUBLIC_BASE_URL + relative WP-like paths
 
 Env:
-- WU_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-- PUBLIC_BASE_URL="" (opzionale; es: https://tuodominio.it)
-- OUTPUT_BASE_DIR="./outputs" (opzionale)
+- WU_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx   (required)
+- OUTPUT_BASE_DIR=./outputs                    (optional)
+- PUBLIC_BASE_URL=                             (optional; e.g. https://tuodominio.it)
+- STATIONS_FILE=stations_by_region.sample.json (optional)
 """
 
 import os
 import json
+import time
+import html
 import random
+import hashlib
 import asyncio
 import aiohttp
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from typing import Any, Dict, Tuple, List, Union, Optional
 
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -38,6 +38,12 @@ from reportlab.lib.colors import HexColor
 from reportlab.lib.enums import TA_CENTER
 from reportlab.graphics.shapes import Drawing
 from reportlab.graphics.charts.barcharts import VerticalBarChart
+
+
+Number = Union[int, float]
+RainValue = Union[Number, str]
+
+RETRY_HTTP_STATUSES = {429, 500, 502, 503, 504}
 
 
 # =========================
@@ -54,30 +60,119 @@ class Config:
     tz_name: str = "Europe/Rome"
 
     # Inputs
-    stations_file: str = "stations_by_region.sample.json"
+    stations_file_env: str = "STATIONS_FILE"
+    stations_file_default: str = "stations_by_region.sample.json"
 
     # Outputs base dir (repo-friendly)
     output_base_dir_env: str = "OUTPUT_BASE_DIR"
     output_base_dir_default: str = "outputs"
 
-    # Public base URL (optional) used in HTML links
+    # Public URL (optional) used in HTML links
     public_base_url_env: str = "PUBLIC_BASE_URL"
-    public_base_url_default: str = ""  # keep relative links by default
+    public_base_url_default: str = ""  # if empty -> keep relative links
 
-    # WP-like relative paths used in HTML (customizable if you want)
-    # These are ONLY for link building (NOT filesystem).
-    # If you don't want WP paths, change these strings.
+    # WP-like relative paths used ONLY for link building (NOT filesystem)
     public_pdf_current_rel: str = "/wp-content/uploads/pdf_stazioni"
     public_pdf_prev_rel: str = "/wp-content/uploads/pdf_stazioni/storico_precedente"
+    public_region_rel: str = "/wp-content/uploads/regioni"  # optional, not used internally
 
-    # Networking
+    # Concurrency / networking
+    concurrent_limit: int = 20
     timeout_total_sec: int = 20
-    min_delay_s: float = 0.25
-    max_delay_s: float = 0.7
-    concurrent_limit: int = 30  # limit concurrency to be gentle with API
+    min_delay_s: float = 0.20
+    max_delay_s: float = 0.60
+    retries: int = 2
+    backoff_base_s: float = 0.5
+    backoff_cap_s: float = 8.0
+
+    # Data sanity
+    max_daily_mm_reasonable: float = 400.0
+
+    # Thresholds (coerenti)
+    over_threshold_mm: float = 200.0  # >=200 "over" fucsia
+    t150_mm: float = 150.0
+    t120_mm: float = 120.0
+    t100_mm: float = 100.0
+    t90_mm: float = 90.0
+    t80_mm: float = 80.0
+    t40_mm: float = 40.0
+    t25_mm: float = 25.0
+
+    # Lock file (anti overlap)
+    lock_file: str = "/tmp/weather_pipeline.lock"
+    lock_stale_seconds: int = 60 * 60 * 3  # 3 hours
 
 
 CFG = Config()
+
+
+# =========================
+# Helpers: filesystem, atomic writes, hashing
+# =========================
+
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def atomic_write_text(path: str, text: str) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def atomic_write_json(path: str, obj: Any) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def sha1_json(obj: Any) -> str:
+    payload = json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha1(payload).hexdigest()
+
+
+def mm_fmt(v: RainValue) -> str:
+    if isinstance(v, (int, float)):
+        return f"{float(v):.2f}"
+    return str(v)
+
+
+def join_url(base: str, path: str) -> str:
+    """Join base url with a path. If base is empty, return path (relative)."""
+    if not base:
+        return path
+    return base.rstrip("/") + "/" + path.lstrip("/")
+
+
+# =========================
+# Helpers: lockfile
+# =========================
+
+def acquire_lock_or_exit(lock_path: str, stale_seconds: int) -> None:
+    now = time.time()
+    if os.path.exists(lock_path):
+        try:
+            mtime = os.path.getmtime(lock_path)
+            age = now - mtime
+            if age > stale_seconds:
+                os.remove(lock_path)
+            else:
+                raise SystemExit(f"⛔ Cron già in esecuzione (lock presente, età ~{int(age)}s). Esco.")
+        except FileNotFoundError:
+            pass
+
+    ensure_dir(os.path.dirname(lock_path) or "/tmp")
+    with open(lock_path, "w", encoding="utf-8") as f:
+        f.write(f"pid={os.getpid()} started={datetime.now(timezone.utc).isoformat()}Z\n")
+
+
+def release_lock(lock_path: str) -> None:
+    try:
+        os.remove(lock_path)
+    except FileNotFoundError:
+        pass
 
 
 # =========================
@@ -103,7 +198,7 @@ def normalize_city_name(city: str) -> str:
 
 
 def month_label_it(month_label: str) -> str:
-    """month_label: YYYY-MM -> 'Febbraio 2026' """
+    """YYYY-MM -> 'Febbraio 2026'"""
     try:
         y, m = month_label.split("-")
         month_it = {
@@ -116,15 +211,25 @@ def month_label_it(month_label: str) -> str:
         return month_label
 
 
-def ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
-
-
-def join_url(base: str, path: str) -> str:
-    """Join base url with a path. If base is empty, return path (relative)."""
-    if not base:
-        return path
-    return base.rstrip("/") + "/" + path.lstrip("/")
+def threshold_class_daily(mm: Number) -> str:
+    v = float(mm)
+    if v >= CFG.over_threshold_mm:
+        return "high-daily-over"
+    if v >= CFG.t150_mm:
+        return "high-daily-150"
+    if v >= CFG.t120_mm:
+        return "high-daily-120"
+    if v >= CFG.t100_mm:
+        return "high-daily-100"
+    if v >= CFG.t90_mm:
+        return "high-daily-90"
+    if v >= CFG.t80_mm:
+        return "high-daily-80"
+    if v >= CFG.t40_mm:
+        return "high-daily-40"
+    if v >= CFG.t25_mm:
+        return "high-daily-25"
+    return ""
 
 
 # =========================
@@ -133,21 +238,15 @@ def join_url(base: str, path: str) -> str:
 
 def genera_pdf_stazione(
     city_name: str,
-    data_giornaliera: dict,
+    data_giornaliera: Dict[str, Number],
     output_folder: str,
     month_label: str,
     update_time: str,
     current_month: str,
+    filename_base: str,
 ) -> str:
-    """
-    Create per-city PDF with:
-    - title + subtitle
-    - optional 'Aggiornato' only for current month
-    - mini bar chart + table with colored thresholds
-    """
-    pdf_name = normalize_city_name(city_name)
-    filename = os.path.join(output_folder, f"{pdf_name}.pdf")
-
+    ensure_dir(output_folder)
+    filename = os.path.join(output_folder, f"{filename_base}.pdf")
     mese_label = month_label_it(month_label)
 
     doc = SimpleDocTemplate(
@@ -206,9 +305,9 @@ def genera_pdf_stazione(
 
     elements.append(Spacer(1, 6))
 
-    # ---- Mini bar chart ----
-    valori = []
-    giorni = []
+    # Mini bar chart
+    giorni: List[str] = []
+    valori: List[float] = []
     for giorno, valore in sorted(data_giornaliera.items()):
         if isinstance(valore, (int, float)):
             giorni.append(str(giorno)[-2:])
@@ -243,7 +342,7 @@ def genera_pdf_stazione(
         elements.append(drawing)
         elements.append(Spacer(1, 12))
 
-    # ---- Table ----
+    # Table
     table_data = [["Giorno", "Pioggia (mm)"]]
     totale_mese = 0.0
     cell_bg_cmds = []
@@ -259,24 +358,23 @@ def genera_pdf_stazione(
         row_idx = len(table_data)
         table_data.append([giorno_label, f"{v:.2f}"])
 
-        # thresholds (same as your HTML)
         bg = None
         fg = None
-        if v > 150:
+        if v >= CFG.over_threshold_mm:
             bg = HexColor("#FF66FF"); fg = colors.black
-        elif v >= 150:
+        elif v >= CFG.t150_mm:
             bg = HexColor("#8C1C6C"); fg = colors.white
-        elif v >= 120:
+        elif v >= CFG.t120_mm:
             bg = HexColor("#595959"); fg = colors.white
-        elif v >= 100:
+        elif v >= CFG.t100_mm:
             bg = HexColor("#0070CD"); fg = colors.white
-        elif v >= 90:
+        elif v >= CFG.t90_mm:
             bg = HexColor("#375623"); fg = colors.white
-        elif v >= 80:
+        elif v >= CFG.t80_mm:
             bg = HexColor("#548235"); fg = colors.white
-        elif v >= 40:
+        elif v >= CFG.t40_mm:
             bg = HexColor("#A9D08E"); fg = colors.black
-        elif v >= 25:
+        elif v >= CFG.t25_mm:
             bg = HexColor("#E2EFDA"); fg = colors.black
 
         if bg is not None:
@@ -326,13 +424,18 @@ def genera_pdf_stazione(
     )
 
     doc.build(elements)
-    print("✅ PDF creato:", filename)
     return filename
 
 
 # =========================
-# API fetch (PWS current)
+# API fetch with retries/backoff + concurrency semaphore
 # =========================
+
+async def backoff_sleep(attempt: int) -> None:
+    base = CFG.backoff_base_s * (2 ** attempt)
+    base = min(base, CFG.backoff_cap_s)
+    await asyncio.sleep(base + random.uniform(0.0, 0.35))
+
 
 async def fetch_weather_data(
     session: aiohttp.ClientSession,
@@ -341,14 +444,12 @@ async def fetch_weather_data(
     api_key: str,
     station_id: str,
     city: str,
-) -> tuple[str, float | str]:
+) -> Tuple[str, str, RainValue]:
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Accept": "application/json,text/plain,*/*",
         "Referer": "https://www.wunderground.com/",
     }
-
-    daily_rain: float | str = "Dati non disponibili"
 
     current_url = (
         f"{api_base}/observations/current"
@@ -356,54 +457,77 @@ async def fetch_weather_data(
         f"&numericPrecision=decimal&format=json&units=e"
     )
 
-    try:
-        async with sem:
-            await asyncio.sleep(random.uniform(CFG.min_delay_s, CFG.max_delay_s))
-            async with session.get(
-                current_url,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=CFG.timeout_total_sec),
-            ) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    obs = (data.get("observations") or [])
-                    if obs:
-                        imperial = obs[0].get("imperial") or {}
-                        precip_in = imperial.get("precipTotal")
-                        if isinstance(precip_in, (int, float)):
-                            daily_mm = inches_to_mm(float(precip_in))
-                            if daily_mm > 400:
-                                print(f"⚠️ Valore anomalo DAILY {station_id} ({city}): {daily_mm} mm")
-                                daily_rain = "⚠️ Errore nella stazione"
-                            else:
-                                daily_rain = daily_mm
-                else:
-                    print(f"⚠️ HTTP {r.status} DAILY {station_id}")
-    except asyncio.TimeoutError:
-        print(f"⏱️ Timeout API per {station_id}")
-    except Exception as e:
-        print(f"❌ Errore API per {station_id}: {e}")
+    async with sem:
+        await asyncio.sleep(random.uniform(CFG.min_delay_s, CFG.max_delay_s))
 
-    return city, daily_rain
+        attempt = 0
+        while True:
+            try:
+                async with session.get(
+                    current_url,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=CFG.timeout_total_sec),
+                ) as r:
+                    if r.status == 200:
+                        try:
+                            data = await r.json()
+                        except Exception:
+                            return station_id, city, "Dati non disponibili"
+
+                        obs = (data.get("observations") or [])
+                        if obs:
+                            imperial = obs[0].get("imperial") or {}
+                            precip_in = imperial.get("precipTotal")
+                            if isinstance(precip_in, (int, float)):
+                                daily_mm = inches_to_mm(float(precip_in))
+                                if daily_mm > CFG.max_daily_mm_reasonable:
+                                    return station_id, city, "⚠️ Errore nella stazione"
+                                return station_id, city, daily_mm
+
+                        return station_id, city, "Dati non disponibili"
+
+                    if r.status in (204, 404):
+                        return station_id, city, "Dati non disponibili"
+
+                    if r.status in RETRY_HTTP_STATUSES and attempt < CFG.retries:
+                        await backoff_sleep(attempt)
+                        attempt += 1
+                        continue
+
+                    return station_id, city, "Dati non disponibili"
+
+            except asyncio.TimeoutError:
+                if attempt < CFG.retries:
+                    await backoff_sleep(attempt)
+                    attempt += 1
+                    continue
+                return station_id, city, "⏱️ Timeout"
+            except Exception:
+                if attempt < CFG.retries:
+                    await backoff_sleep(attempt)
+                    attempt += 1
+                    continue
+                return station_id, city, "❌ Errore"
 
 
 # =========================
-# HTML region builder
+# HTML builder (escaping + station_id aware, wp-linkable)
 # =========================
 
 def build_region_html(
     region: str,
-    stations_data: list[tuple[str, float | str]],
-    storico_data: dict,
+    stations_data: List[Tuple[str, RainValue, str]],  # (city, daily, station_id)
+    storico_data: Dict[str, Dict[str, Number]],
     pdfs_presenti: set[str],
     previous_pdf_dir_abs: str,
     now_it: datetime,
     update_time: str,
     public_base_url: str,
 ) -> str:
-    """Return full HTML string for a region page (responsive, mobile full width)."""
+    region_esc = html.escape(region)
+    cache_bust = now_it.strftime("%Y%m%d%H%M")
 
-    html = f"""<!DOCTYPE html>
+    html_out = f"""<!DOCTYPE html>
 <html lang='it'>
 <head>
   <meta charset='UTF-8'>
@@ -411,7 +535,7 @@ def build_region_html(
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
   <meta http-equiv="Pragma" content="no-cache">
   <meta http-equiv="Expires" content="0">
-  <title>Pioggia - {region}</title>
+  <title>Pioggia - {region_esc}</title>
 
   <style>
     body {{
@@ -491,6 +615,9 @@ def build_region_html(
     .high-daily-150 {{ background-color: #8C1C6C; font-weight: bold; color: white; }}
     .high-daily-over {{ background-color: #FF66FF; font-weight: bold; color: black; }}
 
+    /* ===== NON DISPONIBILE ===== */
+    .na-cell {{ color: #888; font-style: italic; }}
+
     /* ===== MOBILE FULL WIDTH ===== */
     @media screen and (max-width: 768px) {{
       body {{
@@ -525,11 +652,11 @@ def build_region_html(
 </head>
 
 <body>
-  <h1>{region} - Pioggia</h1>
+  <h1>{region_esc} - Pioggia</h1>
 
   <p style='font-size:16px; color:#444; margin-top:-10px;'>
     <span style="font-size:18px;">&#128337;</span>
-    Ultimo aggiornamento: <strong>{update_time}</strong>
+    Ultimo aggiornamento: <strong>{html.escape(update_time)}</strong>
   </p>
 
   <div class="search-box">
@@ -547,66 +674,66 @@ def build_region_html(
         </tr>
 """
 
-    cache_bust = now_it.strftime("%Y%m%d%H%M")
-
-    for city, today_rain in stations_data:
+    for city, today_rain, station_id in stations_data:
         # offline if no numeric values in current month history
         is_offline = city not in storico_data or not any(
             isinstance(v, (int, float)) for v in storico_data.get(city, {}).values()
         )
         city_display = f"🔴 {city}" if is_offline else city
+        city_display_esc = html.escape(city_display)
 
-        # current month PDF
-        pdf_filename = normalize_city_name(city) + ".pdf"
-        pdf_rel = f"{CFG.public_pdf_current_rel}/{pdf_filename}?v={cache_bust}"
+        # filenames (new + legacy)
+        legacy_base = normalize_city_name(city)
+        new_base = f"{legacy_base}_{station_id}"
+
+        # current month PDF link: prefer new, fallback to legacy
+        new_pdf_name = f"{new_base}.pdf"
+        legacy_pdf_name = f"{legacy_base}.pdf"
+
+        chosen_pdf_name = new_pdf_name if new_pdf_name in pdfs_presenti else legacy_pdf_name
+        pdf_rel = f"{CFG.public_pdf_current_rel}/{chosen_pdf_name}?v={cache_bust}"
         pdf_link = join_url(public_base_url, pdf_rel)
         pdf_cell = (
             f"<a href='{pdf_link}' target='_blank'>📄 Scarica</a>"
-            if pdf_filename in pdfs_presenti
+            if chosen_pdf_name in pdfs_presenti
             else "<span style='color:#bbb;' title='PDF non disponibile'>📁</span>"
         )
 
-        # previous month PDF (existence check is filesystem)
-        pdf_prec_filename = normalize_city_name(city) + ".pdf"
-        pdf_prec_abs = os.path.join(previous_pdf_dir_abs, pdf_prec_filename)
-        pdf_prec_rel = f"{CFG.public_pdf_prev_rel}/{pdf_prec_filename}?v={cache_bust}"
-        pdf_prec_link = join_url(public_base_url, pdf_prec_rel)
-        pdf_prec_cell = (
-            f"<a href='{pdf_prec_link}' target='_blank'>📄 Scarica</a>"
-            if os.path.exists(pdf_prec_abs)
-            else "<span style='color:#bbb;' title='PDF non disponibile'>📁</span>"
-        )
+        # previous month PDF (filesystem existence check)
+        prev_new_abs = os.path.join(previous_pdf_dir_abs, new_pdf_name)
+        prev_legacy_abs = os.path.join(previous_pdf_dir_abs, legacy_pdf_name)
 
-        # daily color class
-        daily_class = ""
+        if os.path.exists(prev_new_abs):
+            prev_name = new_pdf_name
+            prev_rel = f"{CFG.public_pdf_prev_rel}/{prev_name}?v={cache_bust}"
+            prev_link = join_url(public_base_url, prev_rel)
+            prev_cell = f"<a href='{prev_link}' target='_blank'>📄 Scarica</a>"
+        elif os.path.exists(prev_legacy_abs):
+            prev_name = legacy_pdf_name
+            prev_rel = f"{CFG.public_pdf_prev_rel}/{prev_name}?v={cache_bust}"
+            prev_link = join_url(public_base_url, prev_rel)
+            prev_cell = f"<a href='{prev_link}' target='_blank'>📄 Scarica</a>"
+        else:
+            prev_cell = "<span style='color:#bbb;' title='PDF non disponibile'>📁</span>"
+
+        # daily value formatting
         if isinstance(today_rain, (int, float)):
-            if today_rain > 150:
-                daily_class = "high-daily-over"
-            elif today_rain >= 150:
-                daily_class = "high-daily-150"
-            elif today_rain >= 120:
-                daily_class = "high-daily-120"
-            elif today_rain >= 100:
-                daily_class = "high-daily-100"
-            elif today_rain >= 90:
-                daily_class = "high-daily-90"
-            elif today_rain >= 80:
-                daily_class = "high-daily-80"
-            elif today_rain >= 40:
-                daily_class = "high-daily-40"
-            elif today_rain >= 25:
-                daily_class = "high-daily-25"
+            daily_class = threshold_class_daily(today_rain)
+            daily_value_str = f"{float(today_rain):.2f}"
+        else:
+            daily_class = "na-cell"
+            daily_value_str = "Dati non disponibili"
 
-        html += (
+        html_out += (
             f"<tr>"
-            f"<td>{city_display}</td>"
-            f"<td class='{daily_class}'>{today_rain}</td>"
+            f"<td>{city_display_esc}</td>"
+            f"<td class='{daily_class}'>{html.escape(daily_value_str)}</td>"
             f"<td>{pdf_cell}</td>"
-            f"<td>{pdf_prec_cell}</td>"
+            f"<td>{prev_cell}</td>"
             f"</tr>"
         )
 
-    html += """
+    html_out += """
       </table>
     </div>
   </div>
@@ -630,242 +757,345 @@ def build_region_html(
 </body>
 </html>
 """
-    return html
+    return html_out
 
 
 # =========================
-# Main
+# Main pipeline
 # =========================
 
 async def main() -> None:
-    # ---- API KEY ----
-    api_key = os.getenv(CFG.api_key_env)
-    if not api_key:
-        raise ValueError(
-            f"{CFG.api_key_env} non impostata. "
-            "Crea un file .env (non committarlo) oppure imposta la variabile d'ambiente."
-        )
+    acquire_lock_or_exit(CFG.lock_file, CFG.lock_stale_seconds)
+    started = time.time()
 
-    # ---- paths ----
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    stations_path = os.path.join(script_dir, CFG.stations_file)
+    try:
+        api_key = os.getenv(CFG.api_key_env)
+        if not api_key:
+            raise RuntimeError(f"{CFG.api_key_env} non impostata in ambiente.")
 
-    output_base_dir = os.getenv(CFG.output_base_dir_env, CFG.output_base_dir_default)
-    output_base_dir = os.path.abspath(os.path.join(script_dir, output_base_dir))
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        stations_file = os.getenv(CFG.stations_file_env, CFG.stations_file_default)
+        stations_path = os.path.join(script_dir, stations_file)
 
-    uploads_dir = os.path.join(output_base_dir, "uploads")
-    backup_json_dir = os.path.join(uploads_dir, "mensili")
-    pdf_output_dir = os.path.join(uploads_dir, "pdf_stazioni")
-    daily_archive_dir = os.path.join(uploads_dir, "giornalieri")
-    regioni_output_dir = os.path.join(uploads_dir, "regioni")
+        with open(stations_path, "r", encoding="utf-8") as f:
+            stations_by_region: Dict[str, Dict[str, str]] = json.load(f)
 
-    ensure_dir(output_base_dir)
-    ensure_dir(uploads_dir)
-    ensure_dir(backup_json_dir)
-    ensure_dir(pdf_output_dir)
-    ensure_dir(daily_archive_dir)
-    ensure_dir(regioni_output_dir)
+        if not isinstance(stations_by_region, dict) or not stations_by_region:
+            raise ValueError("stations_by_region.json non valido o vuoto: deve essere {regione: {station_id: city}}")
 
-    previous_pdf_dir = os.path.join(pdf_output_dir, "storico_precedente")
-    ensure_dir(previous_pdf_dir)
+        # Dates
+        italy_tz = ZoneInfo(CFG.tz_name)
+        now_it = datetime.now(italy_tz)
+        update_time = now_it.strftime("%d/%m/%Y - %H:%M")
+        today = now_it.date()
 
-    # ---- public base url (optional) ----
-    public_base_url = os.getenv(CFG.public_base_url_env, CFG.public_base_url_default)
+        current_month = today.strftime("%Y-%m")
+        previous_month = (today.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+        today_str = today.strftime("%Y-%m-%d")
 
-    # ---- load stations ----
-    with open(stations_path, "r", encoding="utf-8") as f:
-        stations_by_region = json.load(f)
+        # Outputs
+        output_base_dir = os.getenv(CFG.output_base_dir_env, CFG.output_base_dir_default)
+        output_base_dir = os.path.abspath(os.path.join(script_dir, output_base_dir))
 
-    if not isinstance(stations_by_region, dict) or not stations_by_region:
-        raise ValueError("stations_by_region.json non valido o vuoto: deve essere {regione: {station_id: city}}")
+        uploads_dir = os.path.join(output_base_dir, "uploads")
+        backup_json_dir = os.path.join(uploads_dir, "mensili")
+        pdf_output_dir = os.path.join(uploads_dir, "pdf_stazioni")
+        daily_archive_dir = os.path.join(uploads_dir, "giornalieri")
+        regioni_output_dir = os.path.join(uploads_dir, "regioni")
 
-    # ---- dates ----
-    italy_tz = ZoneInfo(CFG.tz_name)
-    now_it = datetime.now(italy_tz)
-    update_time = now_it.strftime("%d/%m/%Y - %H:%M")
-    today = now_it.date()
+        ensure_dir(output_base_dir)
+        ensure_dir(uploads_dir)
+        ensure_dir(backup_json_dir)
+        ensure_dir(pdf_output_dir)
+        ensure_dir(daily_archive_dir)
+        ensure_dir(regioni_output_dir)
 
-    current_month = today.strftime("%Y-%m")
-    previous_month = (today.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
-    today_str = today.strftime("%Y-%m-%d")
+        previous_pdf_dir = os.path.join(pdf_output_dir, "storico_precedente")
+        ensure_dir(previous_pdf_dir)
 
-    previous_json_file = os.path.join(backup_json_dir, f"{previous_month}_storico.json")
-    if not os.path.exists(previous_json_file):
-        previous_json_file = os.path.join(backup_json_dir, f"{previous_month}.json")
+        pdf_meta_dir = os.path.join(pdf_output_dir, "_meta")
+        ensure_dir(pdf_meta_dir)
+        html_meta_dir = os.path.join(regioni_output_dir, "_meta")
+        ensure_dir(html_meta_dir)
 
-    daily_json_file = os.path.join(backup_json_dir, f"{today_str}.json")
-    storico_json_file = os.path.join(backup_json_dir, f"{current_month}_storico.json")
-    daily_history_file = os.path.join(daily_archive_dir, f"{current_month}_giornaliero.json")
-    previous_storico_json = os.path.join(backup_json_dir, f"{previous_month}_storico.json")
+        public_base_url = os.getenv(CFG.public_base_url_env, CFG.public_base_url_default)
 
-    # ---- optional load previous month data (kept for compatibility / logic) ----
-    previous_month_data: dict[str, float] = {}
-    if os.path.exists(previous_json_file):
-        with open(previous_json_file, "r", encoding="utf-8") as f:
-            json_data = json.load(f)
+        # Files
+        daily_json_file = os.path.join(backup_json_dir, f"{today_str}.json")
+        storico_json_file = os.path.join(backup_json_dir, f"{current_month}_storico.json")
+        daily_history_file = os.path.join(daily_archive_dir, f"{current_month}_giornaliero.json")
+        previous_storico_json = os.path.join(backup_json_dir, f"{previous_month}_storico.json")
 
-        if isinstance(json_data, dict) and all(isinstance(v, dict) for v in json_data.values()):
-            for _region, cities in json_data.items():
-                for city, mm in cities.items():
-                    if isinstance(mm, (int, float)):
-                        previous_month_data[str(city).strip()] = float(mm)
-        elif isinstance(json_data, dict):
-            for city, daily_values in json_data.items():
-                if isinstance(daily_values, dict):
-                    total = sum(v for v in daily_values.values() if isinstance(v, (int, float)))
-                    previous_month_data[str(city).strip()] = round(float(total), 2)
+        # Load previous month storico (for prev PDFs)
+        previous_storico_data: Dict[str, Dict[str, Number]] = {}
+        if os.path.exists(previous_storico_json):
+            try:
+                with open(previous_storico_json, "r", encoding="utf-8") as f:
+                    tmp = json.load(f)
+                if isinstance(tmp, dict):
+                    previous_storico_data = tmp
+            except Exception:
+                previous_storico_data = {}
 
-        print(f"✅ File JSON caricato: {previous_json_file} | Città lette: {len(previous_month_data)}")
+        # Build mappings
+        value_to_region: Dict[Tuple[str, str], str] = {}  # (station_id, city) -> region
+        all_stations: List[Tuple[str, str, str]] = []     # (region, station_id, city)
 
-    previous_storico_data = {}
-    if os.path.exists(previous_storico_json):
-        with open(previous_storico_json, "r", encoding="utf-8") as f:
-            previous_storico_data = json.load(f)
-
-    # ---- fetch API ----
-    data_by_region: dict[str, list[tuple[str, float | str]]] = {r: [] for r in stations_by_region.keys()}
-    value_to_region: dict[str, str] = {}
-    for region, stations in stations_by_region.items():
-        for _station_id, city in stations.items():
-            value_to_region[city] = region
-
-    sem = asyncio.Semaphore(CFG.concurrent_limit)
-
-    async with aiohttp.ClientSession() as session:
-        tasks = []
         for region, stations in stations_by_region.items():
+            if not isinstance(stations, dict):
+                continue
             for station_id, city in stations.items():
-                tasks.append(fetch_weather_data(session, sem, CFG.api_base, api_key, station_id, city))
-        results = await asyncio.gather(*tasks)
+                all_stations.append((region, station_id, city))
+                value_to_region[(station_id, city)] = region
 
-    for (city, daily_rain) in results:
-        region = value_to_region.get(city)
-        if region:
-            data_by_region[region].append((city, daily_rain))
+        # Fetch API
+        sem = asyncio.Semaphore(CFG.concurrent_limit)
+        connector = aiohttp.TCPConnector(limit=CFG.concurrent_limit * 2, ssl=False)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            tasks = [
+                fetch_weather_data(session, sem, CFG.api_base, api_key, station_id, city)
+                for (_region, station_id, city) in all_stations
+            ]
+            results: List[Tuple[str, str, RainValue]] = await asyncio.gather(*tasks)
 
-    # ---- daily backup (region -> city -> mm) numeric only ----
-    daily_data: dict[str, dict[str, float]] = {}
-    for region, station_list in data_by_region.items():
-        for city, daily_rain in station_list:
-            if isinstance(daily_rain, (int, float)):
-                daily_data.setdefault(region, {})[city] = float(daily_rain)
+        # Organize per region
+        data_by_region: Dict[str, List[Tuple[str, RainValue, str]]] = {r: [] for r in stations_by_region.keys()}
+        for station_id, city, daily_rain in results:
+            region = value_to_region.get((station_id, city))
+            if region:
+                data_by_region.setdefault(region, []).append((city, daily_rain, station_id))
 
-    with open(daily_json_file, "w", encoding="utf-8") as f:
-        json.dump(daily_data, f, ensure_ascii=False, indent=2)
-    print(f"📅 Backup giornaliero salvato: {daily_json_file}")
+        # Daily backup (region -> city -> mm) numeric only
+        daily_data: Dict[str, Dict[str, Number]] = {}
+        for region, station_list in data_by_region.items():
+            for city, daily_rain, _station_id in station_list:
+                if isinstance(daily_rain, (int, float)):
+                    daily_data.setdefault(region, {})[city] = float(daily_rain)
 
-    # ---- daily history (city -> {YYYY-MM-DD: mm}) ----
-    daily_history: dict[str, dict[str, float]] = {}
-    if os.path.exists(daily_history_file):
-        with open(daily_history_file, "r", encoding="utf-8") as f:
-            daily_history = json.load(f)
+        atomic_write_json(daily_json_file, daily_data)
 
-    for region_cities in daily_data.values():
-        for city, rain_mm in region_cities.items():
-            daily_history.setdefault(city, {})[today_str] = float(rain_mm)
+        # Daily history (city -> {YYYY-MM-DD: mm})
+        daily_history: Dict[str, Dict[str, Number]] = {}
+        if os.path.exists(daily_history_file):
+            try:
+                with open(daily_history_file, "r", encoding="utf-8") as f:
+                    tmp = json.load(f)
+                if isinstance(tmp, dict):
+                    daily_history = tmp
+            except Exception:
+                daily_history = {}
 
-    with open(daily_history_file, "w", encoding="utf-8") as f:
-        json.dump(daily_history, f, ensure_ascii=False, indent=2)
-    print(f"📘 Storico giornaliero aggiornato: {daily_history_file}")
+        for region_cities in daily_data.values():
+            for city, rain_mm in region_cities.items():
+                if isinstance(rain_mm, (int, float)):
+                    daily_history.setdefault(city, {})[today_str] = float(rain_mm)
 
-    # ---- monthly storico for PDFs (city -> {YYYY-MM-DD: mm}) ----
-    storico_data: dict[str, dict[str, float]] = {}
-    if os.path.exists(storico_json_file):
-        with open(storico_json_file, "r", encoding="utf-8") as f:
-            raw_data = json.load(f)
+        atomic_write_json(daily_history_file, daily_history)
 
-        for city, giorni in raw_data.items():
-            if isinstance(giorni, dict):
-                giorni_validi = {
+        # Monthly storico for PDFs (city -> {YYYY-MM-DD: mm})
+        storico_data: Dict[str, Dict[str, Number]] = {}
+        if os.path.exists(storico_json_file):
+            try:
+                with open(storico_json_file, "r", encoding="utf-8") as f:
+                    raw_data = json.load(f)
+                if isinstance(raw_data, dict):
+                    for city, giorni in raw_data.items():
+                        if isinstance(giorni, dict):
+                            giorni_validi = {
+                                str(d): float(v) for d, v in giorni.items()
+                                if str(d).startswith(current_month) and isinstance(v, (int, float))
+                            }
+                            if giorni_validi:
+                                storico_data[str(city)] = giorni_validi
+            except Exception:
+                storico_data = {}
+
+        # insert today's value from daily history
+        for city, daily_values in daily_history.items():
+            v = daily_values.get(today_str)
+            if isinstance(v, (int, float)):
+                storico_data.setdefault(city, {})[today_str] = float(v)
+
+        # keep only current month, remove empties
+        for city in list(storico_data.keys()):
+            storico_data[city] = {
+                d: v for d, v in storico_data[city].items()
+                if str(d).startswith(current_month) and isinstance(v, (int, float))
+            }
+            if not storico_data[city]:
+                del storico_data[city]
+
+        atomic_write_json(storico_json_file, storico_data)
+
+        # Build PDFs current month (SKIP if unchanged via hash)
+        generated_pdfs = 0
+        removed_pdfs = 0
+        valid_pdf_names: set[str] = set()
+
+        for region, station_list in data_by_region.items():
+            for city, _daily_rain, station_id in station_list:
+                giorni = storico_data.get(city) or {}
+                giorni_mese = {
                     d: v for d, v in giorni.items()
                     if str(d).startswith(current_month) and isinstance(v, (int, float))
                 }
-                if giorni_validi:
-                    storico_data[city] = {str(k): float(v) for k, v in giorni_validi.items()}
 
-    # insert today's value from daily history
-    for city, daily_values in daily_history.items():
-        v = daily_values.get(today_str)
-        if isinstance(v, (int, float)):
-            storico_data.setdefault(city, {})[today_str] = float(v)
+                legacy_base = normalize_city_name(city)
+                new_base = f"{legacy_base}_{station_id}"
+                new_pdf_path = os.path.join(pdf_output_dir, f"{new_base}.pdf")
+                legacy_pdf_path = os.path.join(pdf_output_dir, f"{legacy_base}.pdf")
 
-    # keep only current month
-    for city in list(storico_data.keys()):
-        storico_data[city] = {
-            d: v for d, v in storico_data[city].items()
-            if str(d).startswith(current_month) and isinstance(v, (int, float))
-        }
-        if not storico_data[city]:
-            del storico_data[city]
+                if not giorni_mese:
+                    for p in (new_pdf_path, legacy_pdf_path):
+                        if os.path.exists(p):
+                            os.remove(p)
+                            removed_pdfs += 1
+                    meta_path = os.path.join(pdf_meta_dir, f"{new_base}.sha1")
+                    if os.path.exists(meta_path):
+                        os.remove(meta_path)
+                    continue
 
-    with open(storico_json_file, "w", encoding="utf-8") as f:
-        json.dump(storico_data, f, ensure_ascii=False, indent=2)
-    print(f"📘 Storico mensile aggiornato: {storico_json_file}")
+                meta_path = os.path.join(pdf_meta_dir, f"{new_base}.sha1")
+                h = sha1_json(giorni_mese)
+                old = None
+                if os.path.exists(meta_path):
+                    try:
+                        with open(meta_path, "r", encoding="utf-8") as f:
+                            old = f.read().strip()
+                    except Exception:
+                        old = None
 
-    # ---- build current month PDFs ----
-    for city, giorni in storico_data.items():
-        giorni_mese = {
-            d: v for d, v in giorni.items()
-            if str(d).startswith(current_month) and isinstance(v, (int, float))
-        }
-        pdf_path = os.path.join(pdf_output_dir, normalize_city_name(city) + ".pdf")
-        if giorni_mese:
-            genera_pdf_stazione(city, giorni_mese, pdf_output_dir, current_month, update_time, current_month)
-        else:
-            if os.path.exists(pdf_path):
-                os.remove(pdf_path)
+                if old == h and os.path.exists(new_pdf_path):
+                    valid_pdf_names.add(f"{new_base}.pdf")
+                    continue
 
-    # remove orphan PDFs
-    valid_pdf_names = {normalize_city_name(city) + ".pdf" for city in storico_data.keys()}
-    for filename in os.listdir(pdf_output_dir):
-        if filename.endswith(".pdf"):
-            path = os.path.join(pdf_output_dir, filename)
-            if os.path.isfile(path) and filename not in valid_pdf_names and filename != "storico_precedente":
-                os.remove(path)
+                genera_pdf_stazione(
+                    city_name=city,
+                    data_giornaliera=giorni_mese,
+                    output_folder=pdf_output_dir,
+                    month_label=current_month,
+                    update_time=update_time,
+                    current_month=current_month,
+                    filename_base=new_base,
+                )
+                atomic_write_text(meta_path, h)
+                generated_pdfs += 1
+                valid_pdf_names.add(f"{new_base}.pdf")
 
-    # ---- build previous month PDFs (if available) ----
-    if isinstance(previous_storico_data, dict):
-        for city, giorni in previous_storico_data.items():
+        # Remove only new-style orphan PDFs (safe)
+        for fn in os.listdir(pdf_output_dir):
+            p = os.path.join(pdf_output_dir, fn)
+            if os.path.isdir(p) or not fn.endswith(".pdf"):
+                continue
+            if fn in {"storico_precedente"}:
+                continue
+            if "_" in fn and fn not in valid_pdf_names:
+                try:
+                    os.remove(p)
+                    removed_pdfs += 1
+                except Exception:
+                    pass
+
+        # Build previous month PDFs (legacy name is fine)
+        for city, giorni in (previous_storico_data or {}).items():
             if isinstance(giorni, dict) and giorni:
-                genera_pdf_stazione(city, giorni, previous_pdf_dir, previous_month, update_time, current_month)
+                legacy_base = normalize_city_name(city)
+                genera_pdf_stazione(
+                    city_name=str(city),
+                    data_giornaliera={str(k): float(v) for k, v in giorni.items() if isinstance(v, (int, float))},
+                    output_folder=previous_pdf_dir,
+                    month_label=previous_month,
+                    update_time=update_time,
+                    current_month=current_month,
+                    filename_base=legacy_base,
+                )
 
-    pdfs_presenti = set(fn for fn in os.listdir(pdf_output_dir) if fn.endswith(".pdf"))
+        # Compute present PDFs for HTML linking
+        pdfs_presenti = {fn for fn in os.listdir(pdf_output_dir) if fn.endswith(".pdf")}
 
-    # ---- build region HTML files ----
-    for region, stations_data in data_by_region.items():
-        html_content = build_region_html(
-            region=region,
-            stations_data=stations_data,
-            storico_data=storico_data,
-            pdfs_presenti=pdfs_presenti,
-            previous_pdf_dir_abs=previous_pdf_dir,
-            now_it=now_it,
-            update_time=update_time,
-            public_base_url=public_base_url,
+        # Build region HTML (SKIP if unchanged via hash)
+        generated_html = 0
+        for region, station_list in data_by_region.items():
+            stations_for_region = []
+            for (city, today_rain, station_id) in station_list:
+                giorni = storico_data.get(city) or {}
+                offline = not any(isinstance(v, (int, float)) for v in giorni.values())
+
+                legacy_base = normalize_city_name(city)
+                new_name = f"{legacy_base}_{station_id}.pdf"
+                legacy_name = f"{legacy_base}.pdf"
+                current_pdf_present = (new_name in pdfs_presenti) or (legacy_name in pdfs_presenti)
+
+                prev_new_abs = os.path.join(previous_pdf_dir, new_name)
+                prev_legacy_abs = os.path.join(previous_pdf_dir, legacy_name)
+                prev_present = os.path.exists(prev_new_abs) or os.path.exists(prev_legacy_abs)
+
+                stations_for_region.append([
+                    city,
+                    mm_fmt(today_rain),
+                    station_id,
+                    int(offline),
+                    int(current_pdf_present),
+                    int(prev_present),
+                ])
+
+            region_hash_obj = {"region": region, "update_time": update_time, "stations": stations_for_region}
+            region_hash = sha1_json(region_hash_obj)
+
+            meta_path = os.path.join(html_meta_dir, f"{region.lower().replace(' ', '_')}.sha1")
+            old = None
+            if os.path.exists(meta_path):
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        old = f.read().strip()
+                except Exception:
+                    old = None
+
+            file_name = region.lower().replace(" ", "_") + ".html"
+            output_path = os.path.join(regioni_output_dir, file_name)
+
+            if old == region_hash and os.path.exists(output_path):
+                continue
+
+            html_content = build_region_html(
+                region=region,
+                stations_data=station_list,
+                storico_data=storico_data,
+                pdfs_presenti=pdfs_presenti,
+                previous_pdf_dir_abs=previous_pdf_dir,
+                now_it=now_it,
+                update_time=update_time,
+                public_base_url=public_base_url,
+            )
+            atomic_write_text(output_path, html_content)
+            atomic_write_text(meta_path, region_hash)
+            generated_html += 1
+
+        # Optional: if day 1, generate previous month .json from yesterday daily backup
+        if today.day == 1:
+            yesterday = (now_it - timedelta(days=1)).date()
+            yesterday_file = os.path.join(backup_json_dir, f"{yesterday.strftime('%Y-%m-%d')}.json")
+            monthly_file = os.path.join(backup_json_dir, f"{yesterday.strftime('%Y-%m')}.json")
+            if os.path.exists(yesterday_file):
+                try:
+                    with open(yesterday_file, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    atomic_write_json(monthly_file, data)
+                except Exception:
+                    pass
+
+        # Summary
+        elapsed = time.time() - started
+        total = len(all_stations)
+        numeric = sum(1 for _sid, _c, v in results if isinstance(v, (int, float)))
+        errs = total - numeric
+        print(
+            f"✅ Done | stazioni={total} | numeriche={numeric} | non-numeriche={errs} "
+            f"| pdf_gen={generated_pdfs} pdf_rm={removed_pdfs} | html_gen={generated_html} | t={elapsed:.1f}s"
         )
 
-        file_name = region.lower().replace(" ", "_") + ".html"
-        output_path = os.path.join(regioni_output_dir, file_name)
-
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(html_content)
-
-        print(f"✅ HTML salvato per {region}: {output_path}")
-
-    # ---- optional: if day 1, build previous month .json from yesterday daily backup ----
-    if today.day == 1:
-        yesterday = (now_it - timedelta(days=1)).date()
-        yesterday_file = os.path.join(backup_json_dir, f"{yesterday.strftime('%Y-%m-%d')}.json")
-        monthly_file = os.path.join(backup_json_dir, f"{yesterday.strftime('%Y-%m')}.json")
-
-        if os.path.exists(yesterday_file):
-            with open(yesterday_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            with open(monthly_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            print(f"✅ File mensile generato da backup del giorno precedente: {monthly_file}")
-        else:
-            print(f"⚠️ Nessun backup giornaliero trovato per ieri ({yesterday_file})")
+    finally:
+        release_lock(CFG.lock_file)
 
 
 if __name__ == "__main__":
